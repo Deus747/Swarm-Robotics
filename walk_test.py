@@ -7,96 +7,89 @@ import time
 XML_PATH = "scene.xml"
 SIM_DURATION = 600.0
 
-# --- Conservative PD Parameters ---
-KP = np.array([70.0, 60.0, 55.0])
-KD = np.array([3.5, 3.0, 2.8])
-TORQUE_LIMITS = np.array([23.7, 23.7, 45.43])
-SMOOTHING = 0.95
+# --- Control Parameters ---
+KP = 60.0
+KD = 3.0
+VELOCITY_X = 0.5
+STEERING = 0.7  # [-1.0, 1.0] Turn left/right
 
-# --- Original Gait Parameters ---
+# --- Gait Parameters ---
 STAND_BASE = np.array([0.0, 0.9, -1.8])
-WALK_FREQ = 2.0
-SWING_AMP_THIGH = 0.3
-SWING_AMP_CALF = 0.4
 
-# --- Steering Parameters ---
-STEERING_COMMAND = 0.0  # -1.0 (left turn) to 1.0 (right turn), 0.0 = straight
-TURN_RATE = 0.5         # Turn aggressiveness (0.0 to 1.0)
-LEAN_ANGLE = 0.12       # Lean into turn [rad] for stability
-
-# Robot dimensions
+# --- Dimensions per Robot ---
 n_qpos_per_robot = 19
 n_qvel_per_robot = 18
 n_ctrl_per_robot = 12
 
-class LowPassFilter:
-    """Simple exponential smoothing filter"""
-    def __init__(self, alpha):
-        self.alpha = alpha
-        self.value = None
-    
-    def update(self, new_value):
-        if self.value is None:
-            self.value = new_value
-        else:
-            self.value = self.alpha * self.value + (1 - self.alpha) * new_value
-        return self.value
+def pd_controller(target_q, current_q, current_v, kp, kd):
+    return kp * (target_q - current_q) - kd * current_v
 
-def pd_controller(target_q, current_q, current_v, kp, kd, torque_limit):
-    """PD controller with torque saturation only"""
-    torque = kp * (target_q - current_q) - kd * current_v
-    return np.clip(torque, -torque_limit, torque_limit)
-
-def get_gait_target(sim_time, actuator_idx, robot_index=0, steering=0.0):
+def get_gait_target(sim_time, actuator_idx, robot_index=0, steering=0.0, velocity=0.5):
     """
-    Original gait logic with steering capability
-    steering: -1.0 (left) to 1.0 (right), 0.0 = straight
+    Generates target angles with realistic steering dynamics.
+    steering: float in range [-1, 1], controls turn sharpness
+    velocity: forward speed in m/s
     """
-    WALK_FREQ_LOCAL = 2.0
-    SWING_AMP_THIGH_LOCAL = 0.4
-    SWING_AMP_CALF_LOCAL = 0.4
+    # Core gait parameters
+    WALK_FREQ = 2.0
+    SWING_AMP_THIGH = 0.3
+    SWING_AMP_CALF = 0.4
     
-    # Leg identification
-    # Actuator index to leg: 0-2=FR, 3-5=FL, 6-8=RR, 9-11=RL
-    is_left_leg = (actuator_idx >= 3 and actuator_idx < 6) or (actuator_idx >= 9)
-    is_pair_A = (actuator_idx < 3) or (actuator_idx >= 9)  # FR or RL
+    # --- Realistic steering dynamics ---
+    turn_factor = np.clip(abs(steering), 0.0, 1.0)
     
-    # Apply steering by modulating gait frequency per side
-    # Right turn: left legs move faster, right legs slower
-    freq_mod = 1.0
-    if steering != 0.0:
-        # Left legs get +freq, right legs get -freq based on steering direction
-        side_factor = 1.0 if is_left_leg else -1.0
-        freq_mod = 1.0 + (TURN_RATE * steering * side_factor)
+    # Speed reduction during sharp turns (prevents slip, more realistic)
+    effective_vel = velocity * (1.0 - turn_factor * 0.25)
+    vel_scale = np.clip(effective_vel / 0.5, 0.5, 2.0)
     
-    # Phase calculation with optional robot offset
+    # --- Phase calculation (unchanged) ---
     phase_offset = robot_index * 0.5
-    phase = (sim_time * WALK_FREQ_LOCAL * freq_mod * 2 * np.pi + phase_offset) % (2 * np.pi)
-
+    phase = (sim_time * WALK_FREQ * 2 * np.pi + phase_offset) % (2 * np.pi)
+    
+    # --- Leg identification (unchanged) ---
+    is_pair_A = (actuator_idx < 3) or (actuator_idx >= 9)
+    is_right_leg = (actuator_idx < 3) or (actuator_idx >= 6 and actuator_idx < 9)
+    
     if is_pair_A:
         leg_phase = phase
     else:
         leg_phase = phase + np.pi
-
+    
+    # --- Stride scaling (unchanged logic, better tuning) ---
+    if steering > 0:  # Right turn
+        stride_scale = 1.0 + (0.4 * turn_factor if not is_right_leg else -0.25 * turn_factor)
+    else:  # Left turn
+        stride_scale = 1.0 + (0.4 * turn_factor if is_right_leg else -0.25 * turn_factor)
+    
+    stride_scale *= vel_scale
+    
+    # --- Joint calculations (enhanced) ---
     joint_type = actuator_idx % 3
     base_angle = STAND_BASE[joint_type]
     adjustment = 0.0
-
-    if joint_type == 1:  # Thigh
-        adjustment = -SWING_AMP_THIGH_LOCAL * np.sin(leg_phase)
-
-    elif joint_type == 2:  # Calf
+    
+    # Hip: Enhanced with body lean and dynamic abduction
+    if joint_type == 0:
+        # Base lean angle (roll into turn)
+        lean_angle = steering * turn_factor * 0.15
+        adjustment = lean_angle
+        
+        # Dynamic abduction during swing phase (more natural foot placement)
+        swing_intensity = np.clip(np.sin(leg_phase), 0, 1)
+        adjustment += steering * swing_intensity * turn_factor * 0.2
+    
+    # Thigh: Standard swing (unchanged)
+    elif joint_type == 1:
+        adjustment = -SWING_AMP_THIGH * stride_scale * np.sin(leg_phase)
+    
+    # Calf: Standard extension (unchanged)
+    elif joint_type == 2:
         swing_lift = np.cos(leg_phase)
         if swing_lift > 0:
-            adjustment = -SWING_AMP_CALF_LOCAL * swing_lift
+            adjustment = -SWING_AMP_CALF * stride_scale * swing_lift
         else:
             adjustment = 0.0
-
-    # Add lean for steering (abduction joints only)
-    elif joint_type == 0:  # Abduction
-        # Lean opposite to turn direction for centripetal stability
-        adjustment = -steering * LEAN_ANGLE
-
+    
     return base_angle + adjustment
 
 def main():
@@ -104,77 +97,76 @@ def main():
         model = mujoco.MjModel.from_xml_path(XML_PATH)
         data = mujoco.MjData(model)
     except ValueError:
-        print(f"Error: Could not find {XML_PATH}.")
+        print(f"Error: Could not find {XML_PATH}. Run generate_scene.py first.")
         return
 
+    # Determine number of robots based on total actuators
     num_robots = model.nu // n_ctrl_per_robot
-    print(f"Loaded scene with {num_robots} robots. Steering active: {STEERING_COMMAND}")
+    print(f"Loaded Scene with {num_robots} robots. Realistic Steering Enabled...")
 
-    # Original actuator→joint mapping (CRITICAL - DO NOT CHANGE)
-    joint_map = [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]
-    
-    # Pre-compute robot data ranges
-    robot_ranges = []
-    for r in range(num_robots):
-        robot_ranges.append({
-            'qpos_start': r * n_qpos_per_robot + 7,  # Skip root pos/quat
-            'qvel_start': r * n_qvel_per_robot + 6,  # Skip root vel
-            'ctrl_start': r * n_ctrl_per_robot,
-            # One filter per actuator for smooth transitions
-            'filters': [LowPassFilter(SMOOTHING) for _ in range(12)]
-        })
+    # --- MAPPING (Actuator -> Joint) ---
+    joint_map = [
+        3, 4, 5,    # FR Actuator -> FR Joint
+        0, 1, 2,    # FL Actuator -> FL Joint
+        9, 10, 11,  # RR Actuator -> RR Joint
+        6, 7, 8     # RL Actuator -> RL Joint
+    ]
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
+        # Reset to home position
         mujoco.mj_resetDataKeyframe(model, data, 0)
         start_time = time.time()
 
         while viewer.is_running() and time.time() - start_time < SIM_DURATION:
             step_start = time.time()
             sim_time = data.time
-            
+
             # Wait 1 second before walking
             walking_active = sim_time > 1.0
 
-            # --- Control Loop ---
-            for r in robot_ranges:
-                # Get joint states
-                qpos = data.qpos[r['qpos_start'] : r['qpos_start'] + 12]
-                qvel = data.qvel[r['qvel_start'] : r['qvel_start'] + 12]
-                
+            # --- MAIN CONTROL LOOP ---
+            for r in range(num_robots):
+                # Calculate offsets for this specific robot
+                qpos_start_idx = r * n_qpos_per_robot
+                qvel_start_idx = r * n_qvel_per_robot
+                ctrl_start_idx = r * n_ctrl_per_robot
+
+                # Extract this robot's joint states (skip root)
+                robot_joints_q = data.qpos[qpos_start_idx + 7: qpos_start_idx + 19]
+                robot_joints_v = data.qvel[qvel_start_idx + 6: qvel_start_idx + 18]
+
+                # Calculate controls for this robot's 12 actuators
                 for i in range(12):
-                    joint_type = i % 3
-                    
-                    # Get smoothed target with steering
-                    raw_target = get_gait_target(sim_time - 1.0, i, 
-                                                 robot_index=robot_ranges.index(r),
-                                                 steering=STEERING_COMMAND) \
-                                 if walking_active else STAND_BASE[joint_type]
-                    
-                    target = r['filters'][i].update(raw_target)
-                    
-                    # Get current state
+                    # Target angle with realistic steering
+                    if walking_active:
+                        target_angle = get_gait_target(
+                            sim_time - 1.0, i, 
+                            robot_index=r, 
+                            steering=STEERING, 
+                            velocity=VELOCITY_X
+                        )
+                    else:
+                        target_angle = STAND_BASE[i % 3]
+
+                    # Current state (mapped)
                     joint_idx = joint_map[i]
-                    curr_q = qpos[joint_idx]
-                    curr_v = qvel[joint_idx]
+                    curr_q = robot_joints_q[joint_idx]
+                    curr_v = robot_joints_v[joint_idx]
+
+                    # PD Control
+                    torque = pd_controller(target_angle, curr_q, curr_v, KP, KD)
                     
-                    # Apply PD with torque limiting
-                    torque = pd_controller(
-                        target, curr_q, curr_v,
-                        kp=KP[joint_type],
-                        kd=KD[joint_type],
-                        torque_limit=TORQUE_LIMITS[joint_type]
-                    )
-                    
-                    data.ctrl[r['ctrl_start'] + i] = torque
-            
+                    # Apply to global data array
+                    data.ctrl[ctrl_start_idx + i] = torque
+
             # Step simulation
             mujoco.mj_step(model, data)
             viewer.sync()
 
-            # Timing
-            elapsed = time.time() - step_start
-            if (wait_time := model.opt.timestep - elapsed) > 0:
-                time.sleep(wait_time)
+            # Sync time
+            time_until_next_step = model.opt.timestep - (time.time() - step_start)
+            if time_until_next_step > 0:
+                time.sleep(time_until_next_step)
 
 if __name__ == "__main__":
     main()

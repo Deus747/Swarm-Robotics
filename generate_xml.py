@@ -6,7 +6,7 @@ import random
 # 1. FORMATION CONFIGURATION
 # ==============================================================================
 
-NUM_ROBOTS = 3
+NUM_ROBOTS = 6
 
 # Options: "LINE", "GRID", "CIRCLE", "POLYGON", "RANDOM", "CUSTOM", "TRIANGLE"
 FORMATION_TYPE = "TRIANGLE" 
