@@ -1,0 +1,3 @@
+Thu Nov 20 10:24:02 2025
+WARNING: mju_openResource: unknown file 'go2_test/scene.xml'
+
